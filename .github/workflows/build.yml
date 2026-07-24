@@ -40,11 +40,12 @@ jobs:
           </plist>
           PLIST
 
-          # ----- 2. 创建 index.html（就是你的 H5 页面，加上了 KFD 桥接）-----
+          # ----- 2. 创建 index.html（带 UTF-8 声明）-----
           cat > index.html <<'HTML'
           <!DOCTYPE html>
           <html>
           <head>
+              <meta charset="UTF-8">
               <meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'>
               <style>
                   * { margin:0; padding:0; box-sizing:border-box; }
@@ -339,7 +340,7 @@ jobs:
           </html>
           HTML
 
-          # ----- 3. 创建 main.m（原生桥接代码）-----
+          # ----- 3. 创建 main.m（原样不变）-----
           cat > main.m <<MAIN
           #import <UIKit/UIKit.h>
           #import <WebKit/WebKit.h>
