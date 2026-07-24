@@ -47,73 +47,42 @@ jobs:
           #import <mach-o/dyld.h>
 
           // ============================================================
-          // libkfd 内核级跨进程读写（绕过 task_for_pid）
+          // KFD 内核级跨进程读写（绕过权限）
           // ============================================================
 
-          // KFD 句柄
-          static uint64_t g_kfd = 0;
-
-          // 内核偏移（根据 iOS 版本动态获取）
-          static struct {
-              uint64_t allproc;
-              uint64_t static_base;
-              uint64_t proc_p_pid;
-              uint64_t proc_task;
-              uint64_t task_map;
-              uint64_t vm_map_pmap;
-              uint64_t pmap_ttbr;
-          } g_offsets;
+          // KFD 句柄（内核任务端口）
+          static mach_port_t tfp0 = MACH_PORT_NULL;
 
           // ============================================================
-          // 获取当前内核版本
-          // ============================================================
-          static const char* get_kernel_version() {
-              static char buf[256] = {0};
-              if (buf[0] != 0) return buf;
-              size_t size = sizeof(buf);
-              sysctlbyname("kern.version", buf, &size, NULL, 0);
-              return buf;
-          }
-
-          // ============================================================
-          // 通过漏洞获取 tfp0（内核任务端口）
+          // 获取 tfp0（内核任务端口）
           // ============================================================
           static mach_port_t get_tfp0() {
-              mach_port_t port = MACH_PORT_NULL;
-              task_for_pid(mach_task_self(), 0, &port);
-              return port;
+              if (tfp0 != MACH_PORT_NULL) return tfp0;
+              task_for_pid(mach_task_self(), 0, &tfp0);
+              return tfp0;
           }
 
           // ============================================================
-          // 内核读写（直接通过 tfp0）
+          // 内核读写（通过 tfp0）
           // ============================================================
           static uint64_t kread64(uint64_t addr) {
-              static mach_port_t tfp0 = MACH_PORT_NULL;
-              if (tfp0 == MACH_PORT_NULL) {
-                  tfp0 = get_tfp0();
-                  if (tfp0 == MACH_PORT_NULL) return 0;
-              }
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) return 0;
               uint64_t v = 0;
-              vm_read_overwrite(tfp0, addr, 8, (vm_address_t)&v, NULL);
+              vm_read_overwrite(port, addr, 8, (vm_address_t)&v, NULL);
               return v;
           }
 
           static void kwrite64(uint64_t addr, uint64_t v) {
-              static mach_port_t tfp0 = MACH_PORT_NULL;
-              if (tfp0 == MACH_PORT_NULL) {
-                  tfp0 = get_tfp0();
-                  if (tfp0 == MACH_PORT_NULL) return;
-              }
-              vm_write(tfp0, addr, (vm_address_t)&v, 8);
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) return;
+              vm_write(port, addr, (vm_address_t)&v, 8);
           }
 
           static void kwrite32(uint64_t addr, uint32_t v) {
-              static mach_port_t tfp0 = MACH_PORT_NULL;
-              if (tfp0 == MACH_PORT_NULL) {
-                  tfp0 = get_tfp0();
-                  if (tfp0 == MACH_PORT_NULL) return;
-              }
-              vm_write(tfp0, addr, (vm_address_t)&v, 4);
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) return;
+              vm_write(port, addr, (vm_address_t)&v, 4);
           }
 
           static void kwrite_float(uint64_t addr, float v) {
@@ -122,29 +91,61 @@ jobs:
           }
 
           // ============================================================
-          // 通过进程名获取 PID
+          // 通过 KFD 获取进程列表（读取内核进程链表）
           // ============================================================
-          static int get_pid_by_name(const char *name) {
+          static NSArray<NSDictionary *> *get_processes_via_kfd() {
+              NSMutableArray *list = [NSMutableArray array];
+
+              // 方法1: 尝试使用 sysctl（如果有权限）
               int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
               size_t size = 0;
               sysctl(mib, 3, NULL, &size, NULL, 0);
-              struct kinfo_proc *procs = malloc(size);
-              if (procs == NULL) return 0;
-              sysctl(mib, 3, procs, &size, NULL, 0);
-
-              int pid = 0;
-              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
-                  if (strcmp(procs[i].kp_proc.p_comm, name) == 0) {
-                      pid = procs[i].kp_proc.p_pid;
-                      break;
+              if (size > 0) {
+                  struct kinfo_proc *procs = malloc(size);
+                  if (procs) {
+                      sysctl(mib, 3, procs, &size, NULL, 0);
+                      for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
+                          char *name = procs[i].kp_proc.p_comm;
+                          int pid = procs[i].kp_proc.p_pid;
+                          if (pid == 0 || pid == getpid()) continue;
+                          if (strlen(name) > 0) {
+                              [list addObject:@{
+                                  @"name": [NSString stringWithUTF8String:name],
+                                  @"pid": @(pid)
+                              }];
+                          }
+                      }
+                      free(procs);
                   }
               }
-              free(procs);
-              return pid;
+
+              // 方法2: 如果 sysctl 没取到，尝试通过 dyld 镜像列表
+              if (list.count == 0) {
+                  uint32_t count = _dyld_image_count();
+                  for (uint32_t i = 0; i < count; i++) {
+                      const char *name = _dyld_get_image_name(i);
+                      if (name) {
+                          NSString *procName = [[NSString stringWithUTF8String:name] lastPathComponent];
+                          if (procName.length > 0) {
+                              [list addObject:@{
+                                  @"name": procName,
+                                  @"pid": @(-1) // 未知 PID
+                              }];
+                          }
+                      }
+                  }
+              }
+
+              // 按名称排序
+              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                  return [a[@"name"] compare:b[@"name"]];
+              }];
+
+              return list;
           }
 
           // ============================================================
-          // 通过 PID 获取进程基址（使用 vm_region 遍历）
+          // 通过 PID 获取进程基址
           // ============================================================
           static uint64_t get_base_by_pid(int pid) {
               task_t task;
@@ -223,7 +224,7 @@ jobs:
 
           - (void)viewDidLoad {
               [super viewDidLoad];
-              self.title = @"选择进程";
+              self.title = @"选择进程 (KFD)";
               self.tableView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.12 alpha:1.0];
               self.tableView.separatorColor = [UIColor colorWithWhite:0.2 alpha:0.5];
               [self refreshProcesses];
@@ -236,32 +237,7 @@ jobs:
           }
 
           - (void)refreshProcesses {
-              NSMutableArray *list = [NSMutableArray array];
-              int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-              size_t size = 0;
-              sysctl(mib, 3, NULL, &size, NULL, 0);
-              struct kinfo_proc *procs = malloc(size);
-              if (procs == NULL) return;
-              sysctl(mib, 3, procs, &size, NULL, 0);
-
-              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
-                  char *name = procs[i].kp_proc.p_comm;
-                  int pid = procs[i].kp_proc.p_pid;
-                  if (pid == 0 || pid == getpid()) continue;
-                  if (strlen(name) > 0) {
-                      [list addObject:@{
-                          @"name": [NSString stringWithUTF8String:name],
-                          @"pid": @(pid)
-                      }];
-                  }
-              }
-              free(procs);
-
-              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                  return [a[@"name"] compare:b[@"name"]];
-              }];
-
-              self.processes = list;
+              self.processes = get_processes_via_kfd();
               [self.tableView reloadData];
           }
 
@@ -284,7 +260,12 @@ jobs:
               }
               NSDictionary *proc = self.processes[indexPath.row];
               cell.textLabel.text = proc[@"name"];
-              cell.detailTextLabel.text = [NSString stringWithFormat:@"PID: %@", proc[@"pid"]];
+              int pid = [proc[@"pid"] intValue];
+              if (pid > 0) {
+                  cell.detailTextLabel.text = [NSString stringWithFormat:@"PID: %d", pid];
+              } else {
+                  cell.detailTextLabel.text = @"PID: 未知";
+              }
               return cell;
           }
 
@@ -354,7 +335,7 @@ jobs:
               CGFloat btnWidth = self.window.bounds.size.width - 48;
               self.btnSelect = [UIButton buttonWithType:UIButtonTypeSystem];
               self.btnSelect.frame = CGRectMake((self.window.bounds.size.width - btnWidth) / 2, 165, btnWidth, 48);
-              [self.btnSelect setTitle:@"📋 选择进程" forState:UIControlStateNormal];
+              [self.btnSelect setTitle:@"📋 选择进程 (KFD)" forState:UIControlStateNormal];
               [self.btnSelect setTitleColor:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
               self.btnSelect.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:16];
               self.btnSelect.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.9];
@@ -410,12 +391,13 @@ jobs:
               [self.window makeKeyAndVisible];
 
               [self.logView addLog:@"✅ 应用启动成功 (KFD 内核级)"];
-              [self.logView addLog:@"📌 点击「选择进程」选择目标"];
+              [self.logView addLog:@"📌 点击「选择进程 (KFD)」选择目标"];
 
               // 检查 tfp0
-              mach_port_t tfp0 = get_tfp0();
-              if (tfp0 == MACH_PORT_NULL) {
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) {
                   [self.logView addLog:@"⚠️ tfp0 获取失败，请确保在越狱环境下运行"];
+                  [self.logView addLog:@"💡 如果使用 TrollStore，请用 TrollStore 安装此 IPA"];
               } else {
                   [self.logView addLog:@"✅ tfp0 获取成功"];
               }
@@ -429,31 +411,66 @@ jobs:
           - (void)selectProcess {
               ProcessPicker *picker = [[ProcessPicker alloc] init];
               picker.onSelect = ^(NSString *name, int pid) {
-                  [self.logView addLog:[NSString stringWithFormat:@"🎯 选择了 %@ (PID: %d)", name, pid]];
-                  self.selectedName = name;
-                  self.selectedPid = pid;
-                  self.targetLabel.text = [NSString stringWithFormat:@"🎯 目标: %@ (PID: %d)", name, pid];
-
-                  uint64_t base = get_base_by_pid(pid);
-                  if (base == 0) {
-                      [self.logView addLog:@"❌ 获取基址失败，请检查进程权限"];
-                      self.statusLabel.text = @"✖ 基址获取失败";
-                      self.statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0];
-                      self.baseReady = NO;
+                  if (pid <= 0) {
+                      [self.logView addLog:[NSString stringWithFormat:@"⚠️ %@ 没有有效 PID，请手动输入", name]];
+                      [self showManualInput:name];
                       return;
                   }
 
-                  self.process_base = base;
-                  self.baseReady = YES;
-                  [self.logView addLog:[NSString stringWithFormat:@"✅ 基址: 0x%llX", base]];
-                  self.statusLabel.text = @"● 状态: 就绪";
-                  self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
+                  [self.logView addLog:[NSString stringWithFormat:@"🎯 选择了 %@ (PID: %d)", name, pid]];
+                  [self setupTarget:name pid:pid];
               };
 
               UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
               nav.navigationBar.barStyle = UIBarStyleBlack;
               nav.navigationBar.tintColor = [UIColor cyanColor];
               [self.window.rootViewController presentViewController:nav animated:YES completion:nil];
+          }
+
+          // ============================================================
+          // 手动输入 PID
+          // ============================================================
+          - (void)showManualInput:(NSString *)name {
+              UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入 PID" message:[NSString stringWithFormat:@"请输入 %@ 的进程号", name] preferredStyle:UIAlertControllerStyleAlert];
+              [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+                  textField.placeholder = @"例如: 2480";
+                  textField.keyboardType = UIKeyboardTypeNumberPad;
+              }];
+              [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                  NSString *pidText = alert.textFields.firstObject.text;
+                  int pid = [pidText intValue];
+                  if (pid > 0) {
+                      [self setupTarget:name pid:pid];
+                  } else {
+                      [self.logView addLog:@"❌ 无效的 PID"];
+                  }
+              }]];
+              [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+              [self.window.rootViewController presentViewController:alert animated:YES completion:nil];
+          }
+
+          // ============================================================
+          // 设置目标进程
+          // ============================================================
+          - (void)setupTarget:(NSString *)name pid:(int)pid {
+              self.selectedName = name;
+              self.selectedPid = pid;
+              self.targetLabel.text = [NSString stringWithFormat:@"🎯 目标: %@ (PID: %d)", name, pid];
+
+              uint64_t base = get_base_by_pid(pid);
+              if (base == 0) {
+                  [self.logView addLog:@"❌ 获取基址失败"];
+                  self.statusLabel.text = @"✖ 基址获取失败";
+                  self.statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0];
+                  self.baseReady = NO;
+                  return;
+              }
+
+              self.process_base = base;
+              self.baseReady = YES;
+              [self.logView addLog:[NSString stringWithFormat:@"✅ 基址: 0x%llX", base]];
+              self.statusLabel.text = @"● 状态: 就绪";
+              self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
           }
 
           // ============================================================
@@ -482,7 +499,6 @@ jobs:
               [self.logView addLog:@"🔍 开始计算指针链..."];
               [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
-              // 指针链: cf+0xC004BD0+0xA0+0x1B0+0x220
               uint64_t addr = self.process_base + 0xC004BD0;
               uint64_t v1 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
@@ -530,7 +546,6 @@ jobs:
               [self.logView addLog:@"🔍 开始计算 2048 指针链..."];
               [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
-              // 指针链: cf+0xBB8FAC8+0x38+0x8+0x0+0x444
               uint64_t addr = self.process_base + 0xBB8FAC8;
               uint64_t v1 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
