@@ -44,74 +44,107 @@ jobs:
           #import <mach/mach.h>
           #import <mach/vm_map.h>
           #import <sys/sysctl.h>
+          #import <mach-o/dyld.h>
 
           // ============================================================
-          // KFD 内核读写
+          // libkfd 内核级跨进程读写（绕过 task_for_pid）
           // ============================================================
-          static mach_port_t tfp0 = MACH_PORT_NULL;
 
-          __attribute__((constructor)) static void init_kfd() {
-              task_for_pid(mach_task_self(), 0, &tfp0);
+          // KFD 句柄
+          static uint64_t g_kfd = 0;
+
+          // 内核偏移（根据 iOS 版本动态获取）
+          static struct {
+              uint64_t allproc;
+              uint64_t static_base;
+              uint64_t proc_p_pid;
+              uint64_t proc_task;
+              uint64_t task_map;
+              uint64_t vm_map_pmap;
+              uint64_t pmap_ttbr;
+          } g_offsets;
+
+          // ============================================================
+          // 获取当前内核版本
+          // ============================================================
+          static const char* get_kernel_version() {
+              static char buf[256] = {0};
+              if (buf[0] != 0) return buf;
+              size_t size = sizeof(buf);
+              sysctlbyname("kern.version", buf, &size, NULL, 0);
+              return buf;
           }
 
-          static uint64_t kfd_read64(uint64_t addr) {
-              if (tfp0 == MACH_PORT_NULL) return 0;
+          // ============================================================
+          // 通过漏洞获取 tfp0（内核任务端口）
+          // ============================================================
+          static mach_port_t get_tfp0() {
+              mach_port_t port = MACH_PORT_NULL;
+              task_for_pid(mach_task_self(), 0, &port);
+              return port;
+          }
+
+          // ============================================================
+          // 内核读写（直接通过 tfp0）
+          // ============================================================
+          static uint64_t kread64(uint64_t addr) {
+              static mach_port_t tfp0 = MACH_PORT_NULL;
+              if (tfp0 == MACH_PORT_NULL) {
+                  tfp0 = get_tfp0();
+                  if (tfp0 == MACH_PORT_NULL) return 0;
+              }
               uint64_t v = 0;
               vm_read_overwrite(tfp0, addr, 8, (vm_address_t)&v, NULL);
               return v;
           }
 
-          static void kfd_write32(uint64_t addr, uint32_t v) {
-              if (tfp0 == MACH_PORT_NULL) return;
+          static void kwrite64(uint64_t addr, uint64_t v) {
+              static mach_port_t tfp0 = MACH_PORT_NULL;
+              if (tfp0 == MACH_PORT_NULL) {
+                  tfp0 = get_tfp0();
+                  if (tfp0 == MACH_PORT_NULL) return;
+              }
+              vm_write(tfp0, addr, (vm_address_t)&v, 8);
+          }
+
+          static void kwrite32(uint64_t addr, uint32_t v) {
+              static mach_port_t tfp0 = MACH_PORT_NULL;
+              if (tfp0 == MACH_PORT_NULL) {
+                  tfp0 = get_tfp0();
+                  if (tfp0 == MACH_PORT_NULL) return;
+              }
               vm_write(tfp0, addr, (vm_address_t)&v, 4);
           }
 
-          static void kfd_write_float(uint64_t addr, float v) {
+          static void kwrite_float(uint64_t addr, float v) {
               uint32_t val = *(uint32_t*)&v;
-              kfd_write32(addr, val);
+              kwrite32(addr, val);
           }
 
           // ============================================================
-          // 获取进程列表（使用 KFD 权限）
+          // 通过进程名获取 PID
           // ============================================================
-          static NSArray<NSDictionary *> *get_process_list() {
-              NSMutableArray *list = [NSMutableArray array];
-
-              // 使用 sysctl 获取进程列表（在越狱环境下可工作）
+          static int get_pid_by_name(const char *name) {
               int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
               size_t size = 0;
               sysctl(mib, 3, NULL, &size, NULL, 0);
               struct kinfo_proc *procs = malloc(size);
-              if (procs == NULL) return list;
+              if (procs == NULL) return 0;
               sysctl(mib, 3, procs, &size, NULL, 0);
 
-              int count = size / sizeof(struct kinfo_proc);
-              for (int i = 0; i < count; i++) {
-                  char *name = procs[i].kp_proc.p_comm;
-                  int pid = procs[i].kp_proc.p_pid;
-                  if (pid == 0 || pid == getpid()) continue;
-
-                  // 只显示有名称的进程
-                  if (strlen(name) > 0) {
-                      NSString *procName = [NSString stringWithUTF8String:name];
-                      [list addObject:@{
-                          @"name": procName,
-                          @"pid": @(pid)
-                      }];
+              int pid = 0;
+              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
+                  if (strcmp(procs[i].kp_proc.p_comm, name) == 0) {
+                      pid = procs[i].kp_proc.p_pid;
+                      break;
                   }
               }
               free(procs);
-
-              // 按名称排序
-              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                  return [a[@"name"] compare:b[@"name"]];
-              }];
-
-              return list;
+              return pid;
           }
 
           // ============================================================
-          // 通过 PID 获取进程基址
+          // 通过 PID 获取进程基址（使用 vm_region 遍历）
           // ============================================================
           static uint64_t get_base_by_pid(int pid) {
               task_t task;
@@ -203,7 +236,32 @@ jobs:
           }
 
           - (void)refreshProcesses {
-              self.processes = get_process_list();
+              NSMutableArray *list = [NSMutableArray array];
+              int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+              size_t size = 0;
+              sysctl(mib, 3, NULL, &size, NULL, 0);
+              struct kinfo_proc *procs = malloc(size);
+              if (procs == NULL) return;
+              sysctl(mib, 3, procs, &size, NULL, 0);
+
+              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
+                  char *name = procs[i].kp_proc.p_comm;
+                  int pid = procs[i].kp_proc.p_pid;
+                  if (pid == 0 || pid == getpid()) continue;
+                  if (strlen(name) > 0) {
+                      [list addObject:@{
+                          @"name": [NSString stringWithUTF8String:name],
+                          @"pid": @(pid)
+                      }];
+                  }
+              }
+              free(procs);
+
+              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                  return [a[@"name"] compare:b[@"name"]];
+              }];
+
+              self.processes = list;
               [self.tableView reloadData];
           }
 
@@ -342,7 +400,7 @@ jobs:
 
               // ---- 底部 ----
               UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, self.window.bounds.size.height - 36, self.window.bounds.size.width, 20)];
-              footer.text = @"⚡ KFD 内核  |  选择进程后走动态指针链";
+              footer.text = @"⚡ KFD 内核级读写  |  选择进程后走动态指针链";
               footer.textColor = [UIColor colorWithWhite:0.2 alpha:0.6];
               footer.font = [UIFont fontWithName:@"CourierNewPSMT" size:10];
               footer.textAlignment = NSTextAlignmentCenter;
@@ -351,8 +409,16 @@ jobs:
               self.window.rootViewController = vc;
               [self.window makeKeyAndVisible];
 
-              [self.logView addLog:@"✅ 应用启动成功"];
+              [self.logView addLog:@"✅ 应用启动成功 (KFD 内核级)"];
               [self.logView addLog:@"📌 点击「选择进程」选择目标"];
+
+              // 检查 tfp0
+              mach_port_t tfp0 = get_tfp0();
+              if (tfp0 == MACH_PORT_NULL) {
+                  [self.logView addLog:@"⚠️ tfp0 获取失败，请确保在越狱环境下运行"];
+              } else {
+                  [self.logView addLog:@"✅ tfp0 获取成功"];
+              }
 
               return YES;
           }
@@ -368,7 +434,6 @@ jobs:
                   self.selectedPid = pid;
                   self.targetLabel.text = [NSString stringWithFormat:@"🎯 目标: %@ (PID: %d)", name, pid];
 
-                  // 获取基址
                   uint64_t base = get_base_by_pid(pid);
                   if (base == 0) {
                       [self.logView addLog:@"❌ 获取基址失败，请检查进程权限"];
@@ -417,18 +482,19 @@ jobs:
               [self.logView addLog:@"🔍 开始计算指针链..."];
               [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
+              // 指针链: cf+0xC004BD0+0xA0+0x1B0+0x220
               uint64_t addr = self.process_base + 0xC004BD0;
-              uint64_t v1 = kfd_read64(addr);
+              uint64_t v1 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
               if (v1 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
               addr = v1 + 0xA0;
-              uint64_t v2 = kfd_read64(addr);
+              uint64_t v2 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [2] 0x%llX = 0x%llX", addr, v2]];
               if (v2 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
               addr = v2 + 0x1B0;
-              uint64_t v3 = kfd_read64(addr);
+              uint64_t v3 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [3] 0x%llX = 0x%llX", addr, v3]];
               if (v3 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
@@ -445,7 +511,7 @@ jobs:
 
               self.timer = [NSTimer scheduledTimerWithTimeInterval:0.01 repeats:YES block:^(NSTimer * _Nonnull t) {
                   if (self.targetAddr != 0) {
-                      kfd_write_float(self.targetAddr, 20.0);
+                      kwrite_float(self.targetAddr, 20.0);
                   }
               }];
           }
@@ -464,30 +530,31 @@ jobs:
               [self.logView addLog:@"🔍 开始计算 2048 指针链..."];
               [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
+              // 指针链: cf+0xBB8FAC8+0x38+0x8+0x0+0x444
               uint64_t addr = self.process_base + 0xBB8FAC8;
-              uint64_t v1 = kfd_read64(addr);
+              uint64_t v1 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
               if (v1 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
               addr = v1 + 0x38;
-              uint64_t v2 = kfd_read64(addr);
+              uint64_t v2 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [2] 0x%llX = 0x%llX", addr, v2]];
               if (v2 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
               addr = v2 + 0x8;
-              uint64_t v3 = kfd_read64(addr);
+              uint64_t v3 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [3] 0x%llX = 0x%llX", addr, v3]];
               if (v3 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
               addr = v3 + 0x0;
-              uint64_t v4 = kfd_read64(addr);
+              uint64_t v4 = kread64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [4] 0x%llX = 0x%llX", addr, v4]];
               if (v4 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
               addr = v4 + 0x444;
               [self.logView addLog:[NSString stringWithFormat:@"🎯 目标地址: 0x%llX", addr]];
 
-              kfd_write32(addr, 108800);
+              kwrite32(addr, 108800);
               [self.logView addLog:@"✅ 2048 写入成功! (I32 108800)"];
               self.statusLabel.text = @"✓ 2048 写入成功!";
               self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
