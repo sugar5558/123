@@ -43,9 +43,6 @@ jobs:
           #import <UIKit/UIKit.h>
           #import <mach/mach.h>
           #import <mach/vm_map.h>
-          #import <mach-o/dyld.h>
-          #import <dlfcn.h>
-          #import <libproc.h>
           #import <sys/sysctl.h>
 
           // ============================================================
@@ -75,54 +72,55 @@ jobs:
           }
 
           // ============================================================
-          // 自动获取 cf 进程基址（不需要用户操作）
+          // 进程列表获取
           // ============================================================
-          static uint64_t get_cf_base() {
-              // 方法1: 通过 dyld 镜像名
-              uint32_t count = _dyld_image_count();
-              for (uint32_t i = 0; i < count; i++) {
-                  const char *name = _dyld_get_image_name(i);
-                  if (name && strstr(name, "cf") != NULL) {
-                      return (uint64_t)_dyld_get_image_header(i);
-                  }
-              }
-
-              // 方法2: 通过进程名查找
-              int pid = 0;
+          static NSArray<NSDictionary *> *get_process_list() {
+              NSMutableArray *list = [NSMutableArray array];
               int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
               size_t size = 0;
               sysctl(mib, 3, NULL, &size, NULL, 0);
               struct kinfo_proc *procs = malloc(size);
+              if (procs == NULL) return list;
               sysctl(mib, 3, procs, &size, NULL, 0);
 
               for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
-                  if (strcmp(procs[i].kp_proc.p_comm, "cf") == 0) {
-                      pid = procs[i].kp_proc.p_pid;
-                      break;
+                  char *name = procs[i].kp_proc.p_comm;
+                  int pid = procs[i].kp_proc.p_pid;
+                  if (pid == 0) continue;
+                  NSString *procName = [NSString stringWithUTF8String:name];
+                  if (procName.length > 0) {
+                      [list addObject:@{
+                          @"name": procName,
+                          @"pid": @(pid)
+                      }];
                   }
               }
               free(procs);
+              return list;
+          }
 
-              if (pid == 0) return 0;
-
+          // ============================================================
+          // 获取指定进程基址
+          // ============================================================
+          static uint64_t get_process_base(int pid) {
               task_t task;
               task_for_pid(mach_task_self(), pid, &task);
               if (task == MACH_PORT_NULL) return 0;
 
               struct vm_region_submap_info_64 info;
-              mach_msg_type_number_t count2 = VM_REGION_SUBMAP_INFO_COUNT_64;
+              mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
               vm_address_t addr = 0;
-              vm_size_t size2 = 0;
+              vm_size_t size = 0;
               natural_t depth = 0;
 
               while (1) {
-                  kern_return_t kr = vm_region_recurse_64(task, &addr, &size2, &depth, (vm_region_info_64_t)&info, &count2);
+                  kern_return_t kr = vm_region_recurse_64(task, &addr, &size, &depth, (vm_region_info_64_t)&info, &count);
                   if (kr != KERN_SUCCESS) break;
                   if (info.is_submap) { depth++; continue; }
                   if (info.protection & VM_PROT_READ && info.protection & VM_PROT_EXECUTE) {
                       return addr;
                   }
-                  addr += size2;
+                  addr += size;
               }
               return 0;
           }
@@ -168,19 +166,86 @@ jobs:
           @end
 
           // ============================================================
+          // 进程选择器
+          // ============================================================
+          @interface ProcessPicker : UITableViewController
+          @property (nonatomic, copy) void (^onSelect)(NSString *name, int pid);
+          @property (nonatomic, strong) NSArray *processes;
+          @end
+
+          @implementation ProcessPicker
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.title = @"选择进程";
+              self.tableView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.12 alpha:1.0];
+              self.tableView.separatorColor = [UIColor colorWithWhite:0.2 alpha:0.5];
+              [self refreshProcesses];
+
+              // 刷新按钮
+              UIBarButtonItem *refreshBtn = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshProcesses)];
+              self.navigationItem.rightBarButtonItem = refreshBtn;
+
+              // 取消按钮
+              UIBarButtonItem *cancelBtn = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(cancel)];
+              self.navigationItem.leftBarButtonItem = cancelBtn;
+          }
+
+          - (void)refreshProcesses {
+              self.processes = get_process_list();
+              [self.tableView reloadData];
+          }
+
+          - (void)cancel {
+              [self dismissViewControllerAnimated:YES completion:nil];
+          }
+
+          - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+              return self.processes.count;
+          }
+
+          - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+              UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell"];
+              if (!cell) {
+                  cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"cell"];
+                  cell.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1];
+                  cell.textLabel.textColor = [UIColor whiteColor];
+                  cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+                  cell.textLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:14];
+              }
+              NSDictionary *proc = self.processes[indexPath.row];
+              cell.textLabel.text = proc[@"name"];
+              cell.detailTextLabel.text = [NSString stringWithFormat:@"PID: %@", proc[@"pid"]];
+              return cell;
+          }
+
+          - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+              NSDictionary *proc = self.processes[indexPath.row];
+              if (self.onSelect) {
+                  self.onSelect(proc[@"name"], [proc[@"pid"] intValue]);
+              }
+              [self dismissViewControllerAnimated:YES completion:nil];
+          }
+
+          @end
+
+          // ============================================================
           // 主界面
           // ============================================================
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
           @property (strong, nonatomic) UIWindow *window;
           @property (strong, nonatomic) LogView *logView;
+          @property (strong, nonatomic) UIButton *btnSelect;
           @property (strong, nonatomic) UIButton *btnLoop;
           @property (strong, nonatomic) UIButton *btn2048;
           @property (strong, nonatomic) UILabel *statusLabel;
-          @property (strong, nonatomic) UILabel *baseLabel;
+          @property (strong, nonatomic) UILabel *targetLabel;
           @property (nonatomic, assign) BOOL isLooping;
           @property (nonatomic, strong) NSTimer *timer;
           @property (nonatomic, assign) uint64_t targetAddr;
-          @property (nonatomic, assign) uint64_t cf_base;
+          @property (nonatomic, assign) uint64_t process_base;
+          @property (nonatomic, assign) int selectedPid;
+          @property (nonatomic, strong) NSString *selectedName;
           @property (nonatomic, assign) BOOL baseReady;
           @end
 
@@ -200,25 +265,38 @@ jobs:
               title.textAlignment = NSTextAlignmentCenter;
               [vc.view addSubview:title];
 
-              // ---- 基址显示 ----
-              self.baseLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 78, 340, 20)];
-              self.baseLabel.text = @"🔍 正在自动获取基址...";
-              self.baseLabel.textColor = [UIColor colorWithWhite:0.5 alpha:0.8];
-              self.baseLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:12];
-              self.baseLabel.textAlignment = NSTextAlignmentCenter;
-              [vc.view addSubview:self.baseLabel];
+              // ---- 目标显示 ----
+              self.targetLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, 340, 20)];
+              self.targetLabel.text = @"🎯 目标: 未选择";
+              self.targetLabel.textColor = [UIColor colorWithWhite:0.5 alpha:0.8];
+              self.targetLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:12];
+              self.targetLabel.textAlignment = NSTextAlignmentCenter;
+              [vc.view addSubview:self.targetLabel];
 
               // ---- 状态 ----
-              self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 103, 340, 22)];
-              self.statusLabel.text = @"● 状态: 初始化中...";
+              self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 105, 340, 22)];
+              self.statusLabel.text = @"● 状态: 请选择进程";
               self.statusLabel.textColor = [UIColor yellowColor];
               self.statusLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:13];
               self.statusLabel.textAlignment = NSTextAlignmentCenter;
               [vc.view addSubview:self.statusLabel];
 
+              // ---- 选择进程按钮 ----
+              self.btnSelect = [UIButton buttonWithType:UIButtonTypeSystem];
+              self.btnSelect.frame = CGRectMake(20, 140, 340, 44);
+              [self.btnSelect setTitle:@"📋 选择进程" forState:UIControlStateNormal];
+              [self.btnSelect setTitleColor:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+              self.btnSelect.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:15];
+              self.btnSelect.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.8];
+              self.btnSelect.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:0.3].CGColor;
+              self.btnSelect.layer.borderWidth = 1.0;
+              self.btnSelect.layer.cornerRadius = 12;
+              [self.btnSelect addTarget:self action:@selector(selectProcess) forControlEvents:UIControlEventTouchUpInside];
+              [vc.view addSubview:self.btnSelect];
+
               // ---- 蔡徐坤 ----
               self.btnLoop = [UIButton buttonWithType:UIButtonTypeSystem];
-              self.btnLoop.frame = CGRectMake(20, 140, 340, 44);
+              self.btnLoop.frame = CGRectMake(20, 194, 340, 44);
               [self.btnLoop setTitle:@"◉ 蔡徐坤" forState:UIControlStateNormal];
               [self.btnLoop setTitleColor:[UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
               self.btnLoop.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:15];
@@ -231,7 +309,7 @@ jobs:
 
               // ---- 2048 ----
               self.btn2048 = [UIButton buttonWithType:UIButtonTypeSystem];
-              self.btn2048.frame = CGRectMake(20, 192, 340, 44);
+              self.btn2048.frame = CGRectMake(20, 248, 340, 44);
               [self.btn2048 setTitle:@"◉ 2048" forState:UIControlStateNormal];
               [self.btn2048 setTitleColor:[UIColor colorWithRed:0.4 green:1.0 blue:0.6 alpha:1.0] forState:UIControlStateNormal];
               self.btn2048.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:15];
@@ -243,12 +321,12 @@ jobs:
               [vc.view addSubview:self.btn2048];
 
               // ---- 日志 ----
-              self.logView = [[LogView alloc] initWithFrame:CGRectMake(16, 248, 348, 120)];
+              self.logView = [[LogView alloc] initWithFrame:CGRectMake(16, 304, 348, 100)];
               [vc.view addSubview:self.logView];
 
               // ---- 底部 ----
-              UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(20, 378, 340, 16)];
-              footer.text = @"⚡ KFD 内核  |  自动获取 cf 基址";
+              UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(20, 414, 340, 16)];
+              footer.text = @"⚡ KFD 内核  |  选择进程后走动态指针链";
               footer.textColor = [UIColor colorWithWhite:0.3 alpha:0.5];
               footer.font = [UIFont fontWithName:@"CourierNewPSMT" size:10];
               footer.textAlignment = NSTextAlignmentCenter;
@@ -258,50 +336,53 @@ jobs:
               [self.window makeKeyAndVisible];
 
               [self.logView addLog:@"✅ 应用启动成功"];
-              [self.logView addLog:@"🔍 正在自动查找 cf 进程..."];
-
-              // 自动获取基址
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                  [self autoGetBase];
-              });
+              [self.logView addLog:@"📌 点击「选择进程」选择目标"];
 
               return YES;
           }
 
           // ============================================================
-          // 自动获取基址
+          // 选择进程
           // ============================================================
-          - (void)autoGetBase {
-              uint64_t base = get_cf_base();
-              if (base == 0) {
-                  [self.logView addLog:@"❌ 未找到 cf 进程，请确保游戏已运行"];
-                  self.baseLabel.text = @"🔍 基址: 未找到";
-                  self.statusLabel.text = @"✖ 未找到 cf 进程";
-                  self.statusLabel.textColor = [UIColor redColor];
-                  self.baseReady = NO;
-                  return;
-              }
+          - (void)selectProcess {
+              ProcessPicker *picker = [[ProcessPicker alloc] init];
+              picker.onSelect = ^(NSString *name, int pid) {
+                  [self.logView addLog:[NSString stringWithFormat:@"🎯 选择了 %@ (PID: %d)", name, pid]];
+                  self.selectedName = name;
+                  self.selectedPid = pid;
+                  self.targetLabel.text = [NSString stringWithFormat:@"🎯 目标: %@ (PID: %d)", name, pid];
 
-              self.cf_base = base;
-              self.baseReady = YES;
-              [self.logView addLog:[NSString stringWithFormat:@"✅ cf 基址: 0x%llX", base]];
-              self.baseLabel.text = [NSString stringWithFormat:@"📍 基址: 0x%llX", base];
-              self.statusLabel.text = @"● 状态: 就绪";
-              self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
+                  // 获取基址
+                  uint64_t base = get_process_base(pid);
+                  if (base == 0) {
+                      [self.logView addLog:@"❌ 获取基址失败，请检查进程权限"];
+                      self.statusLabel.text = @"✖ 基址获取失败";
+                      self.statusLabel.textColor = [UIColor redColor];
+                      self.baseReady = NO;
+                      return;
+                  }
+
+                  self.process_base = base;
+                  self.baseReady = YES;
+                  [self.logView addLog:[NSString stringWithFormat:@"✅ 基址: 0x%llX", base]];
+                  self.statusLabel.text = @"● 状态: 就绪";
+                  self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
+              };
+              UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
+              nav.navigationBar.barStyle = UIBarStyleBlack;
+              nav.navigationBar.tintColor = [UIColor cyanColor];
+              [self.window.rootViewController presentViewController:nav animated:YES completion:nil];
           }
 
           // ============================================================
-          // 蔡徐坤（完全按你的指针链）
+          // 蔡徐坤
           // ============================================================
           - (void)btnLoopTap:(UIButton *)sender {
               if (!self.baseReady) {
-                  [self.logView addLog:@"⚠️ 基址未就绪，正在重新获取..."];
-                  [self autoGetBase];
-                  if (!self.baseReady) {
-                      [self.logView addLog:@"❌ 请先启动 cf 游戏"];
-                      self.statusLabel.text = @"✖ 请先启动 cf 游戏";
-                      return;
-                  }
+                  [self.logView addLog:@"⚠️ 请先选择进程"];
+                  self.statusLabel.text = @"✖ 请先选择进程";
+                  self.statusLabel.textColor = [UIColor redColor];
+                  return;
               }
 
               if (self.isLooping) {
@@ -317,10 +398,10 @@ jobs:
               }
 
               [self.logView addLog:@"🔍 开始计算指针链..."];
-              [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.cf_base]];
+              [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
               // 指针链: cf+0xC004BD0+0xA0+0x1B0+0x220
-              uint64_t addr = self.cf_base + 0xC004BD0;
+              uint64_t addr = self.process_base + 0xC004BD0;
               uint64_t v1 = kfd_read64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
               if (v1 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
@@ -354,24 +435,21 @@ jobs:
           }
 
           // ============================================================
-          // 2048（完全按你的指针链）
+          // 2048
           // ============================================================
           - (void)btn2048Tap:(UIButton *)sender {
               if (!self.baseReady) {
-                  [self.logView addLog:@"⚠️ 基址未就绪，正在重新获取..."];
-                  [self autoGetBase];
-                  if (!self.baseReady) {
-                      [self.logView addLog:@"❌ 请先启动 cf 游戏"];
-                      self.statusLabel.text = @"✖ 请先启动 cf 游戏";
-                      return;
-                  }
+                  [self.logView addLog:@"⚠️ 请先选择进程"];
+                  self.statusLabel.text = @"✖ 请先选择进程";
+                  self.statusLabel.textColor = [UIColor redColor];
+                  return;
               }
 
               [self.logView addLog:@"🔍 开始计算 2048 指针链..."];
-              [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.cf_base]];
+              [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
               // 指针链: cf+0xBFFC488+0xA0+0x190+0x30+0x444
-              uint64_t addr = self.cf_base + 0xBFFC488;
+              uint64_t addr = self.process_base + 0xBFFC488;
               uint64_t v1 = kfd_read64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
               if (v1 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
