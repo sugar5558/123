@@ -72,34 +72,53 @@ jobs:
           }
 
           // ============================================================
-          // 通过进程名获取 PID
+          // 获取进程列表（使用 KFD 权限）
           // ============================================================
-          static int get_pid_by_name(const char *name) {
+          static NSArray<NSDictionary *> *get_process_list() {
+              NSMutableArray *list = [NSMutableArray array];
+
+              // 使用 sysctl 获取进程列表（在越狱环境下可工作）
               int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
               size_t size = 0;
               sysctl(mib, 3, NULL, &size, NULL, 0);
               struct kinfo_proc *procs = malloc(size);
-              if (procs == NULL) return 0;
+              if (procs == NULL) return list;
               sysctl(mib, 3, procs, &size, NULL, 0);
 
-              int pid = 0;
-              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
-                  if (strcmp(procs[i].kp_proc.p_comm, name) == 0) {
-                      pid = procs[i].kp_proc.p_pid;
-                      break;
+              int count = size / sizeof(struct kinfo_proc);
+              for (int i = 0; i < count; i++) {
+                  char *name = procs[i].kp_proc.p_comm;
+                  int pid = procs[i].kp_proc.p_pid;
+                  if (pid == 0 || pid == getpid()) continue;
+
+                  // 只显示有名称的进程
+                  if (strlen(name) > 0) {
+                      NSString *procName = [NSString stringWithUTF8String:name];
+                      [list addObject:@{
+                          @"name": procName,
+                          @"pid": @(pid)
+                      }];
                   }
               }
               free(procs);
-              return pid;
+
+              // 按名称排序
+              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                  return [a[@"name"] compare:b[@"name"]];
+              }];
+
+              return list;
           }
 
           // ============================================================
-          // 获取进程基址
+          // 通过 PID 获取进程基址
           // ============================================================
-          static uint64_t get_process_base(int pid) {
+          static uint64_t get_base_by_pid(int pid) {
               task_t task;
-              task_for_pid(mach_task_self(), pid, &task);
-              if (task == MACH_PORT_NULL) return 0;
+              kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+              if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
+                  return 0;
+              }
 
               struct vm_region_submap_info_64 info;
               mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
@@ -108,11 +127,11 @@ jobs:
               natural_t depth = 0;
 
               while (1) {
-                  kern_return_t kr = vm_region_recurse_64(task, &addr, &size, &depth, (vm_region_info_64_t)&info, &count);
+                  kr = vm_region_recurse_64(task, &addr, &size, &depth, (vm_region_info_64_t)&info, &count);
                   if (kr != KERN_SUCCESS) break;
                   if (info.is_submap) { depth++; continue; }
                   if (info.protection & VM_PROT_READ && info.protection & VM_PROT_EXECUTE) {
-                      return addr;
+                      return (uint64_t)addr;
                   }
                   addr += size;
               }
@@ -160,82 +179,61 @@ jobs:
           @end
 
           // ============================================================
-          // 输入对话框
+          // 进程选择器
           // ============================================================
-          @interface InputDialog : UIViewController
-          @property (nonatomic, strong) UITextField *textField;
-          @property (nonatomic, copy) void (^onConfirm)(NSString *text);
+          @interface ProcessPicker : UITableViewController
+          @property (nonatomic, copy) void (^onSelect)(NSString *name, int pid);
+          @property (nonatomic, strong) NSArray *processes;
           @end
 
-          @implementation InputDialog
+          @implementation ProcessPicker
 
           - (void)viewDidLoad {
               [super viewDidLoad];
-              self.view.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
-              self.view.layer.cornerRadius = 20;
-              self.view.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:0.3].CGColor;
-              self.view.layer.borderWidth = 0.5;
+              self.title = @"选择进程";
+              self.tableView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.12 alpha:1.0];
+              self.tableView.separatorColor = [UIColor colorWithWhite:0.2 alpha:0.5];
+              [self refreshProcesses];
 
-              // 标题
-              UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 24, 260, 30)];
-              title.text = @"🎯 输入进程名";
-              title.textColor = [UIColor whiteColor];
-              title.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:18];
-              title.textAlignment = NSTextAlignmentCenter;
-              [self.view addSubview:title];
+              UIBarButtonItem *refreshBtn = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshProcesses)];
+              self.navigationItem.rightBarButtonItem = refreshBtn;
 
-              // 输入框
-              self.textField = [[UITextField alloc] initWithFrame:CGRectMake(20, 68, 260, 44)];
-              self.textField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1];
-              self.textField.textColor = [UIColor whiteColor];
-              self.textField.font = [UIFont fontWithName:@"CourierNewPSMT" size:16];
-              self.textField.layer.cornerRadius = 10;
-              self.textField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 14, 44)];
-              self.textField.leftViewMode = UITextFieldViewModeAlways;
-              self.textField.placeholder = @"例如: cf 或 QQ";
-              self.textField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"例如: cf 或 QQ" attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.5 alpha:1]}];
-              [self.view addSubview:self.textField];
+              UIBarButtonItem *cancelBtn = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(cancel)];
+              self.navigationItem.leftBarButtonItem = cancelBtn;
+          }
 
-              // 按钮
-              UIButton *btnCancel = [UIButton buttonWithType:UIButtonTypeSystem];
-              btnCancel.frame = CGRectMake(20, 128, 120, 44);
-              [btnCancel setTitle:@"取消" forState:UIControlStateNormal];
-              [btnCancel setTitleColor:[UIColor colorWithWhite:0.6 alpha:1] forState:UIControlStateNormal];
-              btnCancel.titleLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:15];
-              btnCancel.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
-              btnCancel.layer.cornerRadius = 10;
-              [btnCancel addTarget:self action:@selector(cancel) forControlEvents:UIControlEventTouchUpInside];
-              [self.view addSubview:btnCancel];
-
-              UIButton *btnConfirm = [UIButton buttonWithType:UIButtonTypeSystem];
-              btnConfirm.frame = CGRectMake(160, 128, 120, 44);
-              [btnConfirm setTitle:@"确定" forState:UIControlStateNormal];
-              [btnConfirm setTitleColor:[UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
-              btnConfirm.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:15];
-              btnConfirm.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1];
-              btnConfirm.layer.cornerRadius = 10;
-              [btnConfirm addTarget:self action:@selector(confirm) forControlEvents:UIControlEventTouchUpInside];
-              [self.view addSubview:btnConfirm];
-
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                  [self.textField becomeFirstResponder];
-              });
+          - (void)refreshProcesses {
+              self.processes = get_process_list();
+              [self.tableView reloadData];
           }
 
           - (void)cancel {
               [self dismissViewControllerAnimated:YES completion:nil];
           }
 
-          - (void)confirm {
-              NSString *text = self.textField.text;
-              if (text.length == 0) {
-                  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"" message:@"请输入进程名" preferredStyle:UIAlertControllerStyleAlert];
-                  [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-                  [self presentViewController:alert animated:YES completion:nil];
-                  return;
+          - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+              return self.processes.count;
+          }
+
+          - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+              UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cell"];
+              if (!cell) {
+                  cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"cell"];
+                  cell.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1];
+                  cell.textLabel.textColor = [UIColor whiteColor];
+                  cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+                  cell.textLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:14];
               }
-              if (self.onConfirm) {
-                  self.onConfirm(text);
+              NSDictionary *proc = self.processes[indexPath.row];
+              cell.textLabel.text = proc[@"name"];
+              cell.detailTextLabel.text = [NSString stringWithFormat:@"PID: %@", proc[@"pid"]];
+              return cell;
+          }
+
+          - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+              NSDictionary *proc = self.processes[indexPath.row];
+              if (self.onSelect) {
+                  self.onSelect(proc[@"name"], [proc[@"pid"] intValue]);
               }
               [self dismissViewControllerAnimated:YES completion:nil];
           }
@@ -243,7 +241,7 @@ jobs:
           @end
 
           // ============================================================
-          // 主界面（居中美化版）
+          // 主界面
           // ============================================================
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
           @property (strong, nonatomic) UIWindow *window;
@@ -268,7 +266,6 @@ jobs:
               self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
               UIViewController *vc = [[UIViewController alloc] init];
 
-              // 背景
               vc.view.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.10 alpha:1.0];
 
               // ---- 标题 ----
@@ -277,8 +274,6 @@ jobs:
               title.textColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0];
               title.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:26];
               title.textAlignment = NSTextAlignmentCenter;
-              title.shadowColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:0.15];
-              title.shadowOffset = CGSizeMake(0, 0);
               [vc.view addSubview:title];
 
               // ---- 目标 ----
@@ -297,11 +292,11 @@ jobs:
               self.statusLabel.textAlignment = NSTextAlignmentCenter;
               [vc.view addSubview:self.statusLabel];
 
-              // ---- 选择进程按钮（居中） ----
-              self.btnSelect = [UIButton buttonWithType:UIButtonTypeSystem];
+              // ---- 选择进程 ----
               CGFloat btnWidth = self.window.bounds.size.width - 48;
+              self.btnSelect = [UIButton buttonWithType:UIButtonTypeSystem];
               self.btnSelect.frame = CGRectMake((self.window.bounds.size.width - btnWidth) / 2, 165, btnWidth, 48);
-              [self.btnSelect setTitle:@"📋 输入进程名" forState:UIControlStateNormal];
+              [self.btnSelect setTitle:@"📋 选择进程" forState:UIControlStateNormal];
               [self.btnSelect setTitleColor:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
               self.btnSelect.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:16];
               self.btnSelect.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.9];
@@ -347,7 +342,7 @@ jobs:
 
               // ---- 底部 ----
               UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, self.window.bounds.size.height - 36, self.window.bounds.size.width, 20)];
-              footer.text = @"⚡ KFD 内核  |  输入进程名后走动态指针链";
+              footer.text = @"⚡ KFD 内核  |  选择进程后走动态指针链";
               footer.textColor = [UIColor colorWithWhite:0.2 alpha:0.6];
               footer.font = [UIFont fontWithName:@"CourierNewPSMT" size:10];
               footer.textAlignment = NSTextAlignmentCenter;
@@ -357,7 +352,7 @@ jobs:
               [self.window makeKeyAndVisible];
 
               [self.logView addLog:@"✅ 应用启动成功"];
-              [self.logView addLog:@"📌 点击「输入进程名」输入目标"];
+              [self.logView addLog:@"📌 点击「选择进程」选择目标"];
 
               return YES;
           }
@@ -366,25 +361,15 @@ jobs:
           // 选择进程
           // ============================================================
           - (void)selectProcess {
-              InputDialog *dialog = [[InputDialog alloc] init];
-              dialog.view.frame = CGRectMake(0, 0, 300, 190);
-              dialog.onConfirm = ^(NSString *name) {
-                  [self.logView addLog:[NSString stringWithFormat:@"🔍 查找进程: %@", name]];
-
-                  int pid = get_pid_by_name([name UTF8String]);
-                  if (pid == 0) {
-                      [self.logView addLog:[NSString stringWithFormat:@"❌ 未找到进程: %@", name]];
-                      self.statusLabel.text = [NSString stringWithFormat:@"✖ 未找到 %@", name];
-                      self.statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0];
-                      self.baseReady = NO;
-                      return;
-                  }
-
+              ProcessPicker *picker = [[ProcessPicker alloc] init];
+              picker.onSelect = ^(NSString *name, int pid) {
+                  [self.logView addLog:[NSString stringWithFormat:@"🎯 选择了 %@ (PID: %d)", name, pid]];
                   self.selectedName = name;
                   self.selectedPid = pid;
                   self.targetLabel.text = [NSString stringWithFormat:@"🎯 目标: %@ (PID: %d)", name, pid];
 
-                  uint64_t base = get_process_base(pid);
+                  // 获取基址
+                  uint64_t base = get_base_by_pid(pid);
                   if (base == 0) {
                       [self.logView addLog:@"❌ 获取基址失败，请检查进程权限"];
                       self.statusLabel.text = @"✖ 基址获取失败";
@@ -400,9 +385,10 @@ jobs:
                   self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
               };
 
-              dialog.modalPresentationStyle = UIModalPresentationOverCurrentContext;
-              dialog.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-              [self.window.rootViewController presentViewController:dialog animated:YES completion:nil];
+              UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
+              nav.navigationBar.barStyle = UIBarStyleBlack;
+              nav.navigationBar.tintColor = [UIColor cyanColor];
+              [self.window.rootViewController presentViewController:nav animated:YES completion:nil];
           }
 
           // ============================================================
@@ -465,7 +451,7 @@ jobs:
           }
 
           // ============================================================
-          // 2048（新指针链）
+          // 2048
           // ============================================================
           - (void)btn2048Tap:(UIButton *)sender {
               if (!self.baseReady) {
@@ -478,7 +464,6 @@ jobs:
               [self.logView addLog:@"🔍 开始计算 2048 指针链..."];
               [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", self.process_base]];
 
-              // 新指针链: cf+0xBB8FAC8+0x38+0x8+0x0+0x444
               uint64_t addr = self.process_base + 0xBB8FAC8;
               uint64_t v1 = kfd_read64(addr);
               [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
