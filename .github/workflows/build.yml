@@ -14,10 +14,8 @@ jobs:
 
       - name: Build IPA
         run: |
-          # 创建 App 目录
           mkdir -p Payload/KFD_CF_Mod.app
 
-          # 创建 Info.plist
           cat > Payload/KFD_CF_Mod.app/Info.plist <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -41,13 +39,14 @@ jobs:
           </plist>
           PLIST
 
-          # 写入源代码
           cat > main.m <<SOURCE
           #import <UIKit/UIKit.h>
           #import <mach/mach.h>
           #import <mach/vm_map.h>
 
-          // ===== KFD 内核读写函数 =====
+          // ============================================================
+          // KFD 内核读写
+          // ============================================================
           static mach_port_t tfp0 = MACH_PORT_NULL;
 
           __attribute__((constructor)) static void init_kfd() {
@@ -71,9 +70,58 @@ jobs:
               kfd_write32(addr, val);
           }
 
-          // ===== UI =====
+          // ============================================================
+          // 日志视图
+          // ============================================================
+          @interface LogView : UIScrollView
+          @property (nonatomic, strong) UITextView *textView;
+          - (void)addLog:(NSString *)msg;
+          @end
+
+          @implementation LogView
+          - (instancetype)initWithFrame:(CGRect)frame {
+              self = [super initWithFrame:frame];
+              if (self) {
+                  self.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
+                  self.layer.cornerRadius = 10;
+                  self.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:0.3].CGColor;
+                  self.layer.borderWidth = 0.5;
+
+                  self.textView = [[UITextView alloc] initWithFrame:CGRectMake(8, 8, frame.size.width - 16, frame.size.height - 16)];
+                  self.textView.backgroundColor = [UIColor clearColor];
+                  self.textView.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
+                  self.textView.font = [UIFont fontWithName:@"CourierNewPSMT" size:11];
+                  self.textView.editable = NO;
+                  self.textView.scrollEnabled = YES;
+                  self.textView.text = @"等待操作...\\n";
+                  [self addSubview:self.textView];
+              }
+              return self;
+          }
+
+          - (void)addLog:(NSString *)msg {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  NSDateFormatter *f = [[NSDateFormatter alloc] init];
+                  f.dateFormat = @"HH:mm:ss";
+                  NSString *time = [f stringFromDate:[NSDate date]];
+                  self.textView.text = [NSString stringWithFormat:@"[%@] %@\\n%@", time, msg, self.textView.text];
+                  [self.textView scrollRangeToVisible:NSMakeRange(0, 0)];
+              });
+          }
+          @end
+
+          // ============================================================
+          // 主界面
+          // ============================================================
           @interface AppDelegate : UIResponder <UIApplicationDelegate>
           @property (strong, nonatomic) UIWindow *window;
+          @property (strong, nonatomic) LogView *logView;
+          @property (strong, nonatomic) UIButton *btnLoop;
+          @property (strong, nonatomic) UIButton *btn2048;
+          @property (strong, nonatomic) UILabel *statusLabel;
+          @property (nonatomic, assign) BOOL isLooping;
+          @property (nonatomic, strong) NSTimer *timer;
+          @property (nonatomic, assign) uint64_t targetAddr;
           @end
 
           @implementation AppDelegate
@@ -82,68 +130,58 @@ jobs:
               self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
               UIViewController *vc = [[UIViewController alloc] init];
 
-              // --- 背景 ---
-              UIView *bg = [[UIView alloc] initWithFrame:vc.view.bounds];
-              bg.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.12 alpha:1.0];
-              [vc.view addSubview:bg];
+              // ---- 背景 ----
+              vc.view.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.12 alpha:1.0];
 
-              // 毛玻璃效果
-              UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
-              blur.frame = CGRectMake(20, 80, 340, 280);
-              blur.layer.cornerRadius = 24;
-              blur.layer.masksToBounds = YES;
-              blur.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:0.3].CGColor;
-              blur.layer.borderWidth = 0.5;
-              [vc.view addSubview:blur];
-
-              // --- 标题 ---
-              UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(40, 110, 300, 40)];
+              // ---- 标题 ----
+              UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 50, 340, 40)];
               title.text = @"Q2848456330";
               title.textColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0];
               title.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:24];
               title.textAlignment = NSTextAlignmentCenter;
-              title.shadowColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:0.3];
-              title.shadowOffset = CGSizeMake(0, 0);
               [vc.view addSubview:title];
 
-              // --- 状态 ---
-              UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(40, 155, 300, 25)];
-              status.text = @"● 状态: 就绪";
-              status.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
-              status.font = [UIFont fontWithName:@"CourierNewPSMT" size:13];
-              status.textAlignment = NSTextAlignmentCenter;
-              status.tag = 1;
-              [vc.view addSubview:status];
+              // ---- 状态 ----
+              self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 95, 340, 25)];
+              self.statusLabel.text = @"● 状态: 就绪";
+              self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
+              self.statusLabel.font = [UIFont fontWithName:@"CourierNewPSMT" size:14];
+              self.statusLabel.textAlignment = NSTextAlignmentCenter;
+              [vc.view addSubview:self.statusLabel];
 
-              // --- 蔡徐坤按钮 ---
-              UIButton *btnLoop = [UIButton buttonWithType:UIButtonTypeSystem];
-              btnLoop.frame = CGRectMake(40, 195, 300, 48);
-              [btnLoop setTitle:@"◉ 蔡徐坤" forState:UIControlStateNormal];
-              [btnLoop setTitleColor:[UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
-              btnLoop.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:16];
-              btnLoop.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.8];
-              btnLoop.layer.borderColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:0.4].CGColor;
-              btnLoop.layer.borderWidth = 1.0;
-              btnLoop.layer.cornerRadius = 14;
-              [btnLoop addTarget:self action:@selector(btnLoopTap:) forControlEvents:UIControlEventTouchUpInside];
-              [vc.view addSubview:btnLoop];
+              // ---- 蔡徐坤按钮 ----
+              self.btnLoop = [UIButton buttonWithType:UIButtonTypeSystem];
+              self.btnLoop.frame = CGRectMake(20, 135, 340, 46);
+              [self.btnLoop setTitle:@"◉ 蔡徐坤" forState:UIControlStateNormal];
+              [self.btnLoop setTitleColor:[UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+              self.btnLoop.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:16];
+              self.btnLoop.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.8];
+              self.btnLoop.layer.borderColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:0.4].CGColor;
+              self.btnLoop.layer.borderWidth = 1.0;
+              self.btnLoop.layer.cornerRadius = 14;
+              [self.btnLoop addTarget:self action:@selector(btnLoopTap:) forControlEvents:UIControlEventTouchUpInside];
+              [vc.view addSubview:self.btnLoop];
 
-              // --- 2048 按钮 ---
-              UIButton *btn2048 = [UIButton buttonWithType:UIButtonTypeSystem];
-              btn2048.frame = CGRectMake(40, 253, 300, 48);
-              [btn2048 setTitle:@"◉ 2048" forState:UIControlStateNormal];
-              [btn2048 setTitleColor:[UIColor colorWithRed:0.4 green:1.0 blue:0.6 alpha:1.0] forState:UIControlStateNormal];
-              btn2048.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:16];
-              btn2048.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.8];
-              btn2048.layer.borderColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.6 alpha:0.3].CGColor;
-              btn2048.layer.borderWidth = 1.0;
-              btn2048.layer.cornerRadius = 14;
-              [btn2048 addTarget:self action:@selector(btn2048Tap:) forControlEvents:UIControlEventTouchUpInside];
-              [vc.view addSubview:btn2048];
+              // ---- 2048 按钮 ----
+              self.btn2048 = [UIButton buttonWithType:UIButtonTypeSystem];
+              self.btn2048.frame = CGRectMake(20, 191, 340, 46);
+              [self.btn2048 setTitle:@"◉ 2048" forState:UIControlStateNormal];
+              [self.btn2048 setTitleColor:[UIColor colorWithRed:0.4 green:1.0 blue:0.6 alpha:1.0] forState:UIControlStateNormal];
+              self.btn2048.titleLabel.font = [UIFont fontWithName:@"CourierNewPS-BoldMT" size:16];
+              self.btn2048.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.8];
+              self.btn2048.layer.borderColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.6 alpha:0.3].CGColor;
+              self.btn2048.layer.borderWidth = 1.0;
+              self.btn2048.layer.cornerRadius = 14;
+              [self.btn2048 addTarget:self action:@selector(btn2048Tap:) forControlEvents:UIControlEventTouchUpInside];
+              [vc.view addSubview:self.btn2048];
 
-              // --- 底部信息 ---
-              UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(40, 320, 300, 18)];
-              footer.text = @"⚡ KFD 内核  |  目标: CF";
+              // ---- 日志 ----
+              self.logView = [[LogView alloc] initWithFrame:CGRectMake(16, 250, 348, 140)];
+              [vc.view addSubview:self.logView];
+
+              // ---- 底部 ----
+              UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(20, 400, 340, 18)];
+              footer.text = @"⚡ KFD 内核  |  固定基址: 0x100000000";
               footer.textColor = [UIColor colorWithWhite:0.35 alpha:0.6];
               footer.font = [UIFont fontWithName:@"CourierNewPSMT" size:10];
               footer.textAlignment = NSTextAlignmentCenter;
@@ -151,76 +189,113 @@ jobs:
 
               self.window.rootViewController = vc;
               [self.window makeKeyAndVisible];
+
+              [self.logView addLog:@"✅ 应用启动成功，KFD 已初始化"];
+              [self.logView addLog:@"📌 基址: 0x100000000 (固定)"];
+
               return YES;
           }
 
-          // ===== 蔡徐坤逻辑 =====
+          // ============================================================
+          // 蔡徐坤
+          // ============================================================
           - (void)btnLoopTap:(UIButton *)sender {
-              UIViewController *vc = self.window.rootViewController;
-              UILabel *status = (UILabel *)[vc.view viewWithTag:1];
-              static BOOL isLooping = NO;
-              static NSTimer *timer = nil;
-              static uint64_t targetAddr = 0;
-
-              if (isLooping) {
-                  [timer invalidate];
-                  timer = nil;
-                  isLooping = NO;
+              if (self.isLooping) {
+                  [self.timer invalidate];
+                  self.timer = nil;
+                  self.isLooping = NO;
                   [sender setTitle:@"◉ 蔡徐坤" forState:UIControlStateNormal];
-                  status.text = @"● 状态: 已停止";
-                  status.textColor = [UIColor colorWithRed:1.0 green:0.6 blue:0.1 alpha:1.0];
+                  [sender setTitleColor:[UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+                  self.statusLabel.text = @"● 状态: 已停止";
+                  self.statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.6 blue:0.1 alpha:1.0];
+                  [self.logView addLog:@"⏹ 循环已停止"];
                   return;
               }
 
-              // 原始指针链: cf+0xC004BD0+0xA0+0x1B0+0x220
+              [self.logView addLog:@"🔍 开始计算指针链..."];
+
+              // 固定基址 0x100000000
               uint64_t base = 0x100000000;
+              [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", base]];
+
+              // cf+0xC004BD0
               uint64_t addr = base + 0xC004BD0;
-              addr = kfd_read64(addr) + 0xA0;
-              addr = kfd_read64(addr) + 0x1B0;
-              addr = kfd_read64(addr) + 0x220;
+              uint64_t v1 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
+              if (v1 == 0) { [self.logView addLog:@"❌ 指针链断裂，请检查基址是否正确"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
-              if (addr == 0) {
-                  status.text = @"✖ 状态: 指针断裂";
-                  status.textColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0];
-                  return;
-              }
+              // +0xA0
+              addr = v1 + 0xA0;
+              uint64_t v2 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [2] 0x%llX = 0x%llX", addr, v2]];
+              if (v2 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
 
-              targetAddr = addr;
-              isLooping = YES;
+              // +0x1B0
+              addr = v2 + 0x1B0;
+              uint64_t v3 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [3] 0x%llX = 0x%llX", addr, v3]];
+              if (v3 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
+
+              // +0x220
+              addr = v3 + 0x220;
+              [self.logView addLog:[NSString stringWithFormat:@"🎯 目标地址: 0x%llX", addr]];
+
+              self.targetAddr = addr;
+              self.isLooping = YES;
               [sender setTitle:@"◉ 停止修改" forState:UIControlStateNormal];
               [sender setTitleColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.5 alpha:1.0] forState:UIControlStateNormal];
-              status.text = @"● 状态: 运行中 (F32 20)";
-              status.textColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0];
+              self.statusLabel.text = @"● 状态: 运行中 (F32 20)";
+              self.statusLabel.textColor = [UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:1.0];
+              [self.logView addLog:@"▶ 开始循环写入 F32 20"];
 
-              timer = [NSTimer scheduledTimerWithTimeInterval:0.01 repeats:YES block:^(NSTimer * _Nonnull t) {
-                  if (targetAddr != 0) {
-                      kfd_write_float(targetAddr, 20.0);
+              self.timer = [NSTimer scheduledTimerWithTimeInterval:0.01 repeats:YES block:^(NSTimer * _Nonnull t) {
+                  if (self.targetAddr != 0) {
+                      kfd_write_float(self.targetAddr, 20.0);
                   }
               }];
           }
 
-          // ===== 2048 逻辑 =====
+          // ============================================================
+          // 2048
+          // ============================================================
           - (void)btn2048Tap:(UIButton *)sender {
-              UIViewController *vc = self.window.rootViewController;
-              UILabel *status = (UILabel *)[vc.view viewWithTag:1];
+              [self.logView addLog:@"🔍 开始计算 2048 指针链..."];
 
-              // 原始指针链: cf+0xBFFC488+0xA0+0x190+0x30+0x444
               uint64_t base = 0x100000000;
-              uint64_t addr = base + 0xBFFC488;
-              addr = kfd_read64(addr) + 0xA0;
-              addr = kfd_read64(addr) + 0x190;
-              addr = kfd_read64(addr) + 0x30;
-              addr = kfd_read64(addr) + 0x444;
+              [self.logView addLog:[NSString stringWithFormat:@"📍 基址: 0x%llX", base]];
 
-              if (addr == 0) {
-                  status.text = @"✖ 状态: 指针断裂";
-                  status.textColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0];
-                  return;
-              }
+              // cf+0xBFFC488
+              uint64_t addr = base + 0xBFFC488;
+              uint64_t v1 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [1] 0x%llX = 0x%llX", addr, v1]];
+              if (v1 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
+
+              // +0xA0
+              addr = v1 + 0xA0;
+              uint64_t v2 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [2] 0x%llX = 0x%llX", addr, v2]];
+              if (v2 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
+
+              // +0x190
+              addr = v2 + 0x190;
+              uint64_t v3 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [3] 0x%llX = 0x%llX", addr, v3]];
+              if (v3 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
+
+              // +0x30
+              addr = v3 + 0x30;
+              uint64_t v4 = kfd_read64(addr);
+              [self.logView addLog:[NSString stringWithFormat:@"📖 [4] 0x%llX = 0x%llX", addr, v4]];
+              if (v4 == 0) { [self.logView addLog:@"❌ 指针链断裂"]; self.statusLabel.text = @"✖ 指针断裂"; return; }
+
+              // +0x444
+              addr = v4 + 0x444;
+              [self.logView addLog:[NSString stringWithFormat:@"🎯 目标地址: 0x%llX", addr]];
 
               kfd_write32(addr, 108800);
-              status.text = @"✓ 状态: 2048 写入成功!";
-              status.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
+              [self.logView addLog:@"✅ 2048 写入成功! (I32 108800)"];
+              self.statusLabel.text = @"✓ 2048 写入成功!";
+              self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.5 alpha:1.0];
           }
 
           @end
@@ -232,7 +307,6 @@ jobs:
           }
           SOURCE
 
-          # 编译
           clang -o Payload/KFD_CF_Mod.app/KFD_CF_Mod \
               -framework UIKit \
               -framework Foundation \
@@ -243,7 +317,6 @@ jobs:
               -fobjc-arc \
               main.m
 
-          # 打包 IPA
           zip -r KFD_CF_Mod.ipa Payload
 
       - name: Upload IPA
