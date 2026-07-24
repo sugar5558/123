@@ -14,7 +14,7 @@ jobs:
 
       - name: Build IPA
         run: |
-          # 创建 App 目录
+          # 创建目录
           mkdir -p Payload/KFD_CF_Mod.app
 
           # 创建 Info.plist
@@ -41,10 +41,11 @@ jobs:
           </plist>
           PLIST
 
-          # 写入源代码（直接在这里面，不需要单独的文件）
+          # 写入源代码（使用 vm_read_overwrite 和 vm_write 替代 mach_vm_*）
           cat > main.m <<SOURCE
           #import <UIKit/UIKit.h>
           #import <mach/mach.h>
+          #import <mach/vm_map.h>
 
           static mach_port_t tfp0 = MACH_PORT_NULL;
 
@@ -55,13 +56,13 @@ jobs:
           static uint64_t read64(uint64_t addr) {
               if (tfp0 == MACH_PORT_NULL) return 0;
               uint64_t v = 0;
-              mach_vm_read_overwrite(tfp0, addr, 8, (mach_vm_address_t)&v, NULL);
+              vm_read_overwrite(tfp0, addr, 8, (vm_address_t)&v, NULL);
               return v;
           }
 
           static void write32(uint64_t addr, uint32_t v) {
               if (tfp0 == MACH_PORT_NULL) return;
-              mach_vm_write(tfp0, addr, (mach_vm_address_t)&v, 4);
+              vm_write(tfp0, addr, (vm_address_t)&v, 4);
           }
 
           static void write_float(uint64_t addr, float v) {
