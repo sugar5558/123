@@ -16,7 +16,7 @@ jobs:
         run: |
           mkdir -p Payload/KFD_H5_Loader.app
 
-          # 创建 Info.plist
+          # ----- 1. Info.plist -----
           cat > Payload/KFD_H5_Loader.app/Info.plist <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,8 +40,8 @@ jobs:
           </plist>
           PLIST
 
-          # 创建 index.html（独立 H5 页面）
-          cat > index.html <<HTML
+          # ----- 2. 创建 index.html（就是你的 H5 页面，加上了 KFD 桥接）-----
+          cat > index.html <<'HTML'
           <!DOCTYPE html>
           <html>
           <head>
@@ -125,11 +125,8 @@ jobs:
                   .btn-success:active {
                       background: rgba(68,255,136,0.2);
                   }
-                  .btn-block {
-                      display: block;
-                      width: 100%;
-                      margin-bottom: 10px;
-                  }
+                  .row { display: flex; gap: 10px; margin-bottom: 10px; }
+                  .row .btn { flex: 1; }
                   .status {
                       padding: 12px 16px;
                       border-radius: 12px;
@@ -141,7 +138,6 @@ jobs:
                       min-height: 20px;
                       word-break: break-all;
                   }
-                  .status .highlight { color: #00ffff; }
                   .log {
                       padding: 12px 16px;
                       border-radius: 12px;
@@ -159,8 +155,6 @@ jobs:
                   .log .log-success { color: #44ff88; }
                   .log .log-error { color: #ff4466; }
                   .log .log-info { color: #00ffff; }
-                  .row { display: flex; gap: 10px; margin-bottom: 10px; }
-                  .row .btn { flex: 1; }
                   .footer {
                       text-align: center;
                       margin-top: 16px;
@@ -203,7 +197,7 @@ jobs:
                       const el = document.getElementById('log');
                       const cls = type === 'error' ? 'log-error' : type === 'success' ? 'log-success' : 'log-info';
                       const time = new Date().toLocaleTimeString();
-                      el.innerHTML = `[\${time}] <span class="\${cls}">\${msg}</span>\n` + el.innerHTML;
+                      el.innerHTML = `[${time}] <span class="${cls}">${msg}</span>\n` + el.innerHTML;
                       if (el.scrollTop < 20) el.scrollTop = 0;
                   }
 
@@ -345,7 +339,7 @@ jobs:
           </html>
           HTML
 
-          # 创建 main.m（加载本地 index.html）
+          # ----- 3. 创建 main.m（原生桥接代码）-----
           cat > main.m <<MAIN
           #import <UIKit/UIKit.h>
           #import <WebKit/WebKit.h>
@@ -353,10 +347,7 @@ jobs:
           #import <mach/vm_map.h>
           #import <sys/sysctl.h>
 
-          // ============================================================
-          // 基础内核读写（使用 task_for_pid + vm_read_overwrite）
-          // ============================================================
-
+          // 内核读写函数
           static mach_port_t tfp0 = MACH_PORT_NULL;
 
           static mach_port_t get_tfp0() {
@@ -392,9 +383,7 @@ jobs:
               kwrite32(addr, val);
           }
 
-          // ============================================================
-          // 获取进程列表（sysctl）
-          // ============================================================
+          // 获取进程列表
           static NSArray<NSDictionary *> *get_process_list() {
               NSMutableArray *list = [NSMutableArray array];
               int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
@@ -409,10 +398,7 @@ jobs:
                   int pid = procs[i].kp_proc.p_pid;
                   if (pid == 0 || pid == getpid()) continue;
                   if (strlen(name) > 0) {
-                      [list addObject:@{
-                          @"name": [NSString stringWithUTF8String:name],
-                          @"pid": @(pid)
-                      }];
+                      [list addObject:@{@"name": [NSString stringWithUTF8String:name], @"pid": @(pid)}];
                   }
               }
               free(procs);
@@ -422,9 +408,7 @@ jobs:
               return list;
           }
 
-          // ============================================================
-          // 通过 PID 获取进程基址（vm_region 遍历）
-          // ============================================================
+          // 通过 PID 获取基址
           static uint64_t get_base_by_pid(int pid) {
               task_t task;
               kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -448,9 +432,7 @@ jobs:
               return 0;
           }
 
-          // ============================================================
           // JS 桥接类
-          // ============================================================
           @interface KFDBridge : NSObject
           @property (nonatomic, assign) uint64_t currentBase;
           @property (nonatomic, assign) int currentPid;
@@ -468,8 +450,7 @@ jobs:
 
           - (NSNumber *)getPidByName:(NSString *)name {
               int pid = 0;
-              NSArray *list = get_process_list();
-              for (NSDictionary *proc in list) {
+              for (NSDictionary *proc in get_process_list()) {
                   if ([proc[@"name"] isEqualToString:name]) {
                       pid = [proc[@"pid"] intValue];
                       break;
@@ -502,27 +483,9 @@ jobs:
               return @(self.currentPid);
           }
 
-          // 指针链解析（传入偏移数组）
-          - (NSNumber *)resolveChain:(NSArray *)offsets {
-              if (self.currentBase == 0) return @0;
-              uint64_t addr = self.currentBase;
-              for (NSNumber *off in offsets) {
-                  uint64_t offset = [off unsignedLongLongValue];
-                  addr = addr + offset;
-                  if (off != offsets.lastObject) {
-                      uint64_t v = kread64(addr);
-                      if (v == 0) return @0;
-                      addr = v;
-                  }
-              }
-              return @(addr);
-          }
-
           @end
 
-          // ============================================================
-          // AppDelegate + WebView
-          // ============================================================
+          // AppDelegate
           @interface AppDelegate : UIResponder <UIApplicationDelegate, WKScriptMessageHandler>
           @property (strong, nonatomic) UIWindow *window;
           @property (strong, nonatomic) WKWebView *webView;
@@ -549,7 +512,6 @@ jobs:
               if (htmlURL) {
                   [self.webView loadFileURL:htmlURL allowingReadAccessToURL:[htmlURL URLByDeletingLastPathComponent]];
               } else {
-                  // 降级方案（如果找不到文件，加载空页面）
                   [self.webView loadHTMLString:@"<body style='background:#0a0a1a;color:#00ffcc;padding:20px;'>⚠️ 找不到 index.html</body>" baseURL:nil];
               }
 
@@ -560,9 +522,7 @@ jobs:
               return YES;
           }
 
-          // ============================================================
           // JS 消息处理
-          // ============================================================
           - (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
               if (![message.name isEqualToString:@"kfdBridge"]) return;
               NSDictionary *dict = message.body;
@@ -614,10 +574,10 @@ jobs:
           }
           MAIN
 
-          # 将 index.html 复制到 Payload 目录（最终会随 App 打包）
+          # ----- 4. 复制 HTML 到 Payload -----
           cp index.html Payload/KFD_H5_Loader.app/
 
-          # 编译
+          # ----- 5. 编译 -----
           clang -o Payload/KFD_H5_Loader.app/KFD_H5_Loader \
               -framework UIKit \
               -framework Foundation \
@@ -629,7 +589,7 @@ jobs:
               -fobjc-arc \
               main.m
 
-          # 打包 IPA
+          # ----- 6. 打包 IPA -----
           zip -r KFD_H5_Loader.ipa Payload
 
       - name: Upload IPA
