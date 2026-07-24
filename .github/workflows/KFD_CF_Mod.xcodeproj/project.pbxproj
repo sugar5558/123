@@ -1,0 +1,24 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		FD87A0A12C8F4B2A00A5B3C9 /* KFD_CF_Mod.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KFD_CF_Mod.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FD87A0A02C8F4B2A00A5B3C9 = {isa = PBXGroup; children = (FD87A0AF2C8F4B2A00A5B3C9, FD87A0B02C8F4B2A00A5B3C9,); sourceTree = "<group>";};
+		FD87A0AF2C8F4B2A00A5B3C9 /* KFD_CF_Mod */ = {isa = PBXGroup; children = (FD87A0B12C8F4B2A00A5B3C9 /* main.m */, FD87A0B22C8F4B2A00A5B3C9 /* KFD.h */, FD87A0B32C8F4B2A00A5B3C9 /* KFD.m */, FD87A0B42C8F4B2A00A5B3C9 /* ViewController.h */, FD87A0B52C8F4B2A00A5B3C9 /* ViewController.m */, FD87A0B62C8F4B2A00A5B3C9 /* Info.plist */,); path = KFD_CF_Mod; sourceTree = "<group>";};
+		FD87A0B02C8F4B2A00A5B3C9 /* Products */ = {isa = PBXGroup; children = (FD87A0A12C8F4B2A00A5B3C9,); name = Products; sourceTree = "<group>";};
+		FD87A0A22C8F4B2A00A5B3C9 /* Project object */ = {isa = PBXProject; attributes = {LastUpgradeCheck = 1500;}; buildConfigurationList = FD87A0A52C8F4B2A00A5B3C9; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = FD87A0A02C8F4B2A00A5B3C9; productRefGroup = FD87A0B02C8F4B2A00A5B3C9; projectDirPath = ""; projectRoot = ""; targets = (FD87A0A02C8F4B2A00A5B3C9);};
+		FD87A0A02C8F4B2A00A5B3C9 /* KFD_CF_Mod */ = {isa = PBXNativeTarget; buildConfigurationList = FD87A0A62C8F4B2A00A5B3C9; buildPhases = (FD87A0A72C8F4B2A00A5B3C9, FD87A0A82C8F4B2A00A5B3C9, FD87A0A92C8F4B2A00A5B3C9,); buildRules = (); dependencies = (); name = KFD_CF_Mod; productName = KFD_CF_Mod; productReference = FD87A0A12C8F4B2A00A5B3C9; productType = "com.apple.product-type.application";};
+		FD87A0A52C8F4B2A00A5B3C9 /* Build configuration list for PBXProject "KFD_CF_Mod" */ = {isa = XCConfigurationList; buildConfigurations = (FD87A0AA2C8F4B2A00A5B3C9 /* Debug */, FD87A0AB2C8F4B2A00A5B3C9 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		FD87A0A62C8F4B2A00A5B3C9 /* Build configuration list for PBXNativeTarget "KFD_CF_Mod" */ = {isa = XCConfigurationList; buildConfigurations = (FD87A0AC2C8F4B2A00A5B3C9 /* Debug */, FD87A0AD2C8F4B2A00A5B3C9 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		FD87A0AA2C8F4B2A00A5B3C9 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {IPHONEOS_DEPLOYMENT_TARGET = 15.0; SDKROOT = iphoneos;}; name = Debug;};
+		FD87A0AB2C8F4B2A00A5B3C9 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {IPHONEOS_DEPLOYMENT_TARGET = 15.0; SDKROOT = iphoneos;}; name = Release;};
+		FD87A0AC2C8F4B2A00A5B3C9 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; PRODUCT_BUNDLE_IDENTIFIER = com.yourname.kfdcfmod; PRODUCT_NAME = KFD_CF_Mod;}; name = Debug;};
+		FD87A0AD2C8F4B2A00A5B3C9 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; PRODUCT_BUNDLE_IDENTIFIER = com.yourname.kfdcfmod; PRODUCT_NAME = KFD_CF_Mod;}; name = Release;};
+		FD87A0A72C8F4B2A00A5B3C9 /* Sources */ = {isa = PBXSourcesBuildPhase; files = (FD87A0AE2C8F4B2A00A5B3C9 /* main.m in Sources */, FD87A0AF2C8F4B2A00A5B3C9 /* KFD.m in Sources */, FD87A0B02C8F4B2A00A5B3C9 /* ViewController.m in Sources */,);};
+		FD87A0A82C8F4B2A00A5B3C9 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; files = ();};
+		FD87A0A92C8F4B2A00A5B3C9 /* Resources */ = {isa = PBXResourcesBuildPhase; files = ();};
+	};
+	rootObject = FD87A0A22C8F4B2A00A5B3C9;
+}
