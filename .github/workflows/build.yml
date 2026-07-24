@@ -40,218 +40,8 @@ jobs:
           </plist>
           PLIST
 
-          # 创建 main.m
-          cat > main.m <<MAIN
-          #import <UIKit/UIKit.h>
-          #import <WebKit/WebKit.h>
-          #import <mach/mach.h>
-          #import <mach/vm_map.h>
-          #import <sys/sysctl.h>
-
-          // ============================================================
-          // 基础内核读写（使用 task_for_pid + vm_read_overwrite）
-          // ============================================================
-
-          static mach_port_t tfp0 = MACH_PORT_NULL;
-
-          static mach_port_t get_tfp0() {
-              if (tfp0 != MACH_PORT_NULL) return tfp0;
-              task_for_pid(mach_task_self(), 0, &tfp0);
-              return tfp0;
-          }
-
-          static uint64_t kread64(uint64_t addr) {
-              mach_port_t port = get_tfp0();
-              if (port == MACH_PORT_NULL) return 0;
-              uint64_t v = 0;
-              vm_read_overwrite(port, addr, 8, (vm_address_t)&v, NULL);
-              return v;
-          }
-
-          static uint32_t kread32(uint64_t addr) {
-              mach_port_t port = get_tfp0();
-              if (port == MACH_PORT_NULL) return 0;
-              uint32_t v = 0;
-              vm_read_overwrite(port, addr, 4, (vm_address_t)&v, NULL);
-              return v;
-          }
-
-          static void kwrite32(uint64_t addr, uint32_t v) {
-              mach_port_t port = get_tfp0();
-              if (port == MACH_PORT_NULL) return;
-              vm_write(port, addr, (vm_address_t)&v, 4);
-          }
-
-          static void kwrite_float(uint64_t addr, float v) {
-              uint32_t val = *(uint32_t*)&v;
-              kwrite32(addr, val);
-          }
-
-          // ============================================================
-          // 获取进程列表（sysctl）
-          // ============================================================
-          static NSArray<NSDictionary *> *get_process_list() {
-              NSMutableArray *list = [NSMutableArray array];
-              int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-              size_t size = 0;
-              sysctl(mib, 3, NULL, &size, NULL, 0);
-              struct kinfo_proc *procs = malloc(size);
-              if (!procs) return list;
-              sysctl(mib, 3, procs, &size, NULL, 0);
-
-              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
-                  char *name = procs[i].kp_proc.p_comm;
-                  int pid = procs[i].kp_proc.p_pid;
-                  if (pid == 0 || pid == getpid()) continue;
-                  if (strlen(name) > 0) {
-                      [list addObject:@{
-                          @"name": [NSString stringWithUTF8String:name],
-                          @"pid": @(pid)
-                      }];
-                  }
-              }
-              free(procs);
-              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-                  return [a[@"name"] compare:b[@"name"]];
-              }];
-              return list;
-          }
-
-          // ============================================================
-          // 通过 PID 获取进程基址（vm_region 遍历）
-          // ============================================================
-          static uint64_t get_base_by_pid(int pid) {
-              task_t task;
-              kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-              if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) return 0;
-
-              struct vm_region_submap_info_64 info;
-              mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-              vm_address_t addr = 0;
-              vm_size_t size = 0;
-              natural_t depth = 0;
-
-              while (1) {
-                  kr = vm_region_recurse_64(task, &addr, &size, &depth, (vm_region_info_64_t)&info, &count);
-                  if (kr != KERN_SUCCESS) break;
-                  if (info.is_submap) { depth++; continue; }
-                  if (info.protection & VM_PROT_READ && info.protection & VM_PROT_EXECUTE) {
-                      return (uint64_t)addr;
-                  }
-                  addr += size;
-              }
-              return 0;
-          }
-
-          // ============================================================
-          // JS 桥接类
-          // ============================================================
-          @interface KFDBridge : NSObject
-          @property (nonatomic, assign) uint64_t currentBase;
-          @property (nonatomic, assign) int currentPid;
-          @end
-
-          @implementation KFDBridge
-
-          - (NSNumber *)getBaseByPid:(int)pid {
-              uint64_t base = get_base_by_pid(pid);
-              if (base == 0) return @0;
-              self.currentPid = pid;
-              self.currentBase = base;
-              return @(base);
-          }
-
-          - (NSNumber *)getPidByName:(NSString *)name {
-              int pid = 0;
-              NSArray *list = get_process_list();
-              for (NSDictionary *proc in list) {
-                  if ([proc[@"name"] isEqualToString:name]) {
-                      pid = [proc[@"pid"] intValue];
-                      break;
-                  }
-              }
-              return @(pid);
-          }
-
-          - (NSNumber *)read64:(NSNumber *)addr {
-              return @(kread64([addr unsignedLongLongValue]));
-          }
-
-          - (NSNumber *)read32:(NSNumber *)addr {
-              return @(kread32([addr unsignedLongLongValue]));
-          }
-
-          - (void)write32:(NSNumber *)addr value:(NSNumber *)value {
-              kwrite32([addr unsignedLongLongValue], [value unsignedIntValue]);
-          }
-
-          - (void)writeFloat:(NSNumber *)addr value:(NSNumber *)value {
-              kwrite_float([addr unsignedLongLongValue], [value floatValue]);
-          }
-
-          - (NSNumber *)getBase {
-              return @(self.currentBase);
-          }
-
-          - (NSNumber *)getPid {
-              return @(self.currentPid);
-          }
-
-          // 指针链解析（传入偏移数组）
-          - (NSNumber *)resolveChain:(NSArray *)offsets {
-              if (self.currentBase == 0) return @0;
-              uint64_t addr = self.currentBase;
-              for (NSNumber *off in offsets) {
-                  uint64_t offset = [off unsignedLongLongValue];
-                  addr = addr + offset;
-                  // 如果不是最后一个偏移，读一下取下一级地址
-                  if (off != offsets.lastObject) {
-                      uint64_t v = kread64(addr);
-                      if (v == 0) return @0;
-                      addr = v;
-                  }
-              }
-              return @(addr);
-          }
-
-          @end
-
-          // ============================================================
-          // AppDelegate + WebView
-          // ============================================================
-          @interface AppDelegate : UIResponder <UIApplicationDelegate, WKScriptMessageHandler>
-          @property (strong, nonatomic) UIWindow *window;
-          @property (strong, nonatomic) WKWebView *webView;
-          @property (strong, nonatomic) KFDBridge *bridge;
-          @end
-
-          @implementation AppDelegate
-
-          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-
-              self.bridge = [[KFDBridge alloc] init];
-
-              WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-              WKUserContentController *controller = [[WKUserContentController alloc] init];
-              [controller addScriptMessageHandler:self name:@"kfdBridge"];
-              config.userContentController = controller;
-
-              self.webView = [[WKWebView alloc] initWithFrame:self.window.bounds configuration:config];
-              self.webView.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.10 alpha:1.0];
-
-              // 加载内置 H5 页面
-              [self loadH5UI];
-
-              self.window.rootViewController = [[UIViewController alloc] init];
-              [self.window.rootViewController.view addSubview:self.webView];
-              [self.window makeKeyAndVisible];
-
-              return YES;
-          }
-
-          - (void)loadH5UI {
-              NSString *html = @"
+          # 创建 index.html（独立 H5 页面）
+          cat > index.html <<HTML
           <!DOCTYPE html>
           <html>
           <head>
@@ -553,9 +343,221 @@ jobs:
               </script>
           </body>
           </html>
-          ";
+          HTML
 
-              [self.webView loadHTMLString:html baseURL:nil];
+          # 创建 main.m（加载本地 index.html）
+          cat > main.m <<MAIN
+          #import <UIKit/UIKit.h>
+          #import <WebKit/WebKit.h>
+          #import <mach/mach.h>
+          #import <mach/vm_map.h>
+          #import <sys/sysctl.h>
+
+          // ============================================================
+          // 基础内核读写（使用 task_for_pid + vm_read_overwrite）
+          // ============================================================
+
+          static mach_port_t tfp0 = MACH_PORT_NULL;
+
+          static mach_port_t get_tfp0() {
+              if (tfp0 != MACH_PORT_NULL) return tfp0;
+              task_for_pid(mach_task_self(), 0, &tfp0);
+              return tfp0;
+          }
+
+          static uint64_t kread64(uint64_t addr) {
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) return 0;
+              uint64_t v = 0;
+              vm_read_overwrite(port, addr, 8, (vm_address_t)&v, NULL);
+              return v;
+          }
+
+          static uint32_t kread32(uint64_t addr) {
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) return 0;
+              uint32_t v = 0;
+              vm_read_overwrite(port, addr, 4, (vm_address_t)&v, NULL);
+              return v;
+          }
+
+          static void kwrite32(uint64_t addr, uint32_t v) {
+              mach_port_t port = get_tfp0();
+              if (port == MACH_PORT_NULL) return;
+              vm_write(port, addr, (vm_address_t)&v, 4);
+          }
+
+          static void kwrite_float(uint64_t addr, float v) {
+              uint32_t val = *(uint32_t*)&v;
+              kwrite32(addr, val);
+          }
+
+          // ============================================================
+          // 获取进程列表（sysctl）
+          // ============================================================
+          static NSArray<NSDictionary *> *get_process_list() {
+              NSMutableArray *list = [NSMutableArray array];
+              int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+              size_t size = 0;
+              sysctl(mib, 3, NULL, &size, NULL, 0);
+              struct kinfo_proc *procs = malloc(size);
+              if (!procs) return list;
+              sysctl(mib, 3, procs, &size, NULL, 0);
+
+              for (int i = 0; i < size / sizeof(struct kinfo_proc); i++) {
+                  char *name = procs[i].kp_proc.p_comm;
+                  int pid = procs[i].kp_proc.p_pid;
+                  if (pid == 0 || pid == getpid()) continue;
+                  if (strlen(name) > 0) {
+                      [list addObject:@{
+                          @"name": [NSString stringWithUTF8String:name],
+                          @"pid": @(pid)
+                      }];
+                  }
+              }
+              free(procs);
+              [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                  return [a[@"name"] compare:b[@"name"]];
+              }];
+              return list;
+          }
+
+          // ============================================================
+          // 通过 PID 获取进程基址（vm_region 遍历）
+          // ============================================================
+          static uint64_t get_base_by_pid(int pid) {
+              task_t task;
+              kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+              if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) return 0;
+
+              struct vm_region_submap_info_64 info;
+              mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+              vm_address_t addr = 0;
+              vm_size_t size = 0;
+              natural_t depth = 0;
+
+              while (1) {
+                  kr = vm_region_recurse_64(task, &addr, &size, &depth, (vm_region_info_64_t)&info, &count);
+                  if (kr != KERN_SUCCESS) break;
+                  if (info.is_submap) { depth++; continue; }
+                  if (info.protection & VM_PROT_READ && info.protection & VM_PROT_EXECUTE) {
+                      return (uint64_t)addr;
+                  }
+                  addr += size;
+              }
+              return 0;
+          }
+
+          // ============================================================
+          // JS 桥接类
+          // ============================================================
+          @interface KFDBridge : NSObject
+          @property (nonatomic, assign) uint64_t currentBase;
+          @property (nonatomic, assign) int currentPid;
+          @end
+
+          @implementation KFDBridge
+
+          - (NSNumber *)getBaseByPid:(int)pid {
+              uint64_t base = get_base_by_pid(pid);
+              if (base == 0) return @0;
+              self.currentPid = pid;
+              self.currentBase = base;
+              return @(base);
+          }
+
+          - (NSNumber *)getPidByName:(NSString *)name {
+              int pid = 0;
+              NSArray *list = get_process_list();
+              for (NSDictionary *proc in list) {
+                  if ([proc[@"name"] isEqualToString:name]) {
+                      pid = [proc[@"pid"] intValue];
+                      break;
+                  }
+              }
+              return @(pid);
+          }
+
+          - (NSNumber *)read64:(NSNumber *)addr {
+              return @(kread64([addr unsignedLongLongValue]));
+          }
+
+          - (NSNumber *)read32:(NSNumber *)addr {
+              return @(kread32([addr unsignedLongLongValue]));
+          }
+
+          - (void)write32:(NSNumber *)addr value:(NSNumber *)value {
+              kwrite32([addr unsignedLongLongValue], [value unsignedIntValue]);
+          }
+
+          - (void)writeFloat:(NSNumber *)addr value:(NSNumber *)value {
+              kwrite_float([addr unsignedLongLongValue], [value floatValue]);
+          }
+
+          - (NSNumber *)getBase {
+              return @(self.currentBase);
+          }
+
+          - (NSNumber *)getPid {
+              return @(self.currentPid);
+          }
+
+          // 指针链解析（传入偏移数组）
+          - (NSNumber *)resolveChain:(NSArray *)offsets {
+              if (self.currentBase == 0) return @0;
+              uint64_t addr = self.currentBase;
+              for (NSNumber *off in offsets) {
+                  uint64_t offset = [off unsignedLongLongValue];
+                  addr = addr + offset;
+                  if (off != offsets.lastObject) {
+                      uint64_t v = kread64(addr);
+                      if (v == 0) return @0;
+                      addr = v;
+                  }
+              }
+              return @(addr);
+          }
+
+          @end
+
+          // ============================================================
+          // AppDelegate + WebView
+          // ============================================================
+          @interface AppDelegate : UIResponder <UIApplicationDelegate, WKScriptMessageHandler>
+          @property (strong, nonatomic) UIWindow *window;
+          @property (strong, nonatomic) WKWebView *webView;
+          @property (strong, nonatomic) KFDBridge *bridge;
+          @end
+
+          @implementation AppDelegate
+
+          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+
+              self.bridge = [[KFDBridge alloc] init];
+
+              WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+              WKUserContentController *controller = [[WKUserContentController alloc] init];
+              [controller addScriptMessageHandler:self name:@"kfdBridge"];
+              config.userContentController = controller;
+
+              self.webView = [[WKWebView alloc] initWithFrame:self.window.bounds configuration:config];
+              self.webView.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.10 alpha:1.0];
+
+              // 加载本地 HTML
+              NSURL *htmlURL = [[NSBundle mainBundle] URLForResource:@"index" withExtension:@"html"];
+              if (htmlURL) {
+                  [self.webView loadFileURL:htmlURL allowingReadAccessToURL:[htmlURL URLByDeletingLastPathComponent]];
+              } else {
+                  // 降级方案（如果找不到文件，加载空页面）
+                  [self.webView loadHTMLString:@"<body style='background:#0a0a1a;color:#00ffcc;padding:20px;'>⚠️ 找不到 index.html</body>" baseURL:nil];
+              }
+
+              self.window.rootViewController = [[UIViewController alloc] init];
+              [self.window.rootViewController.view addSubview:self.webView];
+              [self.window makeKeyAndVisible];
+
+              return YES;
           }
 
           // ============================================================
@@ -590,7 +592,10 @@ jobs:
               } else {
                   SEL sel0 = NSSelectorFromString(method);
                   if ([self.bridge respondsToSelector:sel0]) {
+                      #pragma clang diagnostic push
+                      #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                       result = [self.bridge performSelector:sel0];
+                      #pragma clang diagnostic pop
                   }
               }
 
@@ -608,6 +613,9 @@ jobs:
               }
           }
           MAIN
+
+          # 将 index.html 复制到 Payload 目录（最终会随 App 打包）
+          cp index.html Payload/KFD_H5_Loader.app/
 
           # 编译
           clang -o Payload/KFD_H5_Loader.app/KFD_H5_Loader \
