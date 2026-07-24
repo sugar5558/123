@@ -14,7 +14,7 @@ jobs:
 
       - name: Build IPA
         run: |
-          # 创建目录
+          # 创建 App 目录
           mkdir -p Payload/KFD_CF_Mod.app
 
           # 创建 Info.plist
@@ -41,7 +41,7 @@ jobs:
           </plist>
           PLIST
 
-          # 写入源代码（使用 vm_read_overwrite 和 vm_write 替代 mach_vm_*）
+          # 写入源代码（不链接 MachO 框架，用 Foundation 替代）
           cat > main.m <<SOURCE
           #import <UIKit/UIKit.h>
           #import <mach/mach.h>
@@ -198,11 +198,10 @@ jobs:
           }
           SOURCE
 
-          # 编译
+          # 编译（不链接 MachO）
           clang -o Payload/KFD_CF_Mod.app/KFD_CF_Mod \
               -framework UIKit \
               -framework Foundation \
-              -framework MachO \
               -ObjC \
               -x objective-c \
               -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
