@@ -17,17 +17,12 @@ jobs:
           git clone --depth=1 https://github.com/theos/theos.git $HOME/theos
           echo "$HOME/theos/bin" >> $GITHUB_PATH
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          # 设置 SDK 路径为 Xcode 自带 iOS SDK
           echo "THEOS_SDK_PATH=$(xcodebuild -version -sdk iphoneos Path)" >> $GITHUB_ENV
 
       - name: Build Package
         run: |
           export THEOS_DEVICE_IP=localhost
           export THEOS_DEVICE_PORT=22
-          # 确保 Makefile 存在
-          if [ ! -f Makefile ]; then echo "Makefile not found"; exit 1; fi
-          # 使用绝对路径调用 theos 的 make
-          $HOME/theos/bin/nicify.pl
           make package
         env:
           THEOS: ${{ env.THEOS }}
