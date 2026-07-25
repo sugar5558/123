@@ -1,0 +1,9 @@
+Package: com.yourname.aimassist
+Name: AimAssist
+Version: 1.0
+Architecture: iphoneos-arm
+Description: 自动瞄准 + 2048 修改（内核级，全伪装）
+Maintainer: Your Name
+Author: Your Name
+Section: Tweaks
+Depends: mobilesubstrate
