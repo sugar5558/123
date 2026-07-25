@@ -23,7 +23,10 @@ jobs:
         run: |
           export THEOS_DEVICE_IP=localhost
           export THEOS_DEVICE_PORT=22
-          make package
+          pwd
+          ls -la
+          if [ ! -f Makefile ]; then echo "Makefile 不存在！"; exit 1; fi
+          $THEOS/bin/make package
         env:
           THEOS: ${{ env.THEOS }}
 
