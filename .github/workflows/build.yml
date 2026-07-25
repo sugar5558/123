@@ -1,0 +1,36 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl build-essential
+          git clone --depth=1 https://github.com/theos/theos.git $HOME/theos
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          mkdir -p $HOME/theos/sdks
+          curl -L https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.0.sdk.tar.xz -o iPhoneOS17.0.sdk.tar.xz
+          tar -xJf iPhoneOS17.0.sdk.tar.xz -C $HOME/theos/sdks
+
+      - name: Build Package
+        run: |
+          export THEOS_DEVICE_IP=localhost
+          export THEOS_DEVICE_PORT=22
+          make package
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: AimAssist.deb
+          path: ./packages/*.deb
