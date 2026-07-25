@@ -20,7 +20,8 @@ jobs:
           echo "$HOME/theos/bin" >> $GITHUB_PATH
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           mkdir -p $HOME/theos/sdks
-          curl -L https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS17.0.sdk.tar.xz -o iPhoneOS17.0.sdk.tar.xz
+          # 使用 Theos 官方 SDK 源（替换失效链接）
+          curl -L --retry 3 --fail https://github.com/theos/sdks/raw/master/iPhoneOS17.0.sdk.tar.xz -o iPhoneOS17.0.sdk.tar.xz
           tar -xJf iPhoneOS17.0.sdk.tar.xz -C $HOME/theos/sdks
 
       - name: Build Package
